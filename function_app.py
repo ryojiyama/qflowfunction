@@ -10,8 +10,8 @@ import logging
 
 app = func.FunctionApp()
 
-@app.route(route="qflowTrigger", auth_level=func.AuthLevel.FUNCTION)
-def qflowTrigger(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="StampPDF", auth_level=func.AuthLevel.FUNCTION)
+def StampPDF(req: func.HttpRequest) -> func.HttpResponse:
     try:
         # 1. リクエスト解析
         req_body = req.get_json()
@@ -66,8 +66,11 @@ def qflowTrigger(req: func.HttpRequest) -> func.HttpResponse:
             qr_rect = fitz.Rect(15, qr_y_pos, 15 + qr_size, qr_y_pos + qr_size)
             page.insert_image(qr_rect, stream=qr_bytes)
 
-            # 中央：識別子 (登録した "jp-bold" を使う)
-            id_text = f"{meta.get('dept')}-{meta.get('product')}-{meta.get('category')}-{meta.get('year')}-{meta.get('seq')}"
+            # 中央：識別子（もし integrated_id が直接送られてきたらそれを使い、無ければ従来通り結合する）
+            if meta.get('integrated_id'):
+                id_text = meta.get('integrated_id')
+            else:
+                id_text = f"{meta.get('dept')}-{meta.get('product')}-{meta.get('category')}-{meta.get('year')}-{meta.get('seq')}"
             page.insert_text(
                 (65, rect.height - 28),
                 id_text,
