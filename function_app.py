@@ -182,8 +182,7 @@ def StampPDF(req: func.HttpRequest) -> func.HttpResponse:
 
         parsed_url = urllib.parse.urlparse(temp_file_url)
         decoded_path = urllib.parse.unquote(parsed_url.path)
-        file_relative_path = decoded_path.split("Shared Documents/")[1]
-        file_name = file_relative_path.rsplit("/", 1)[1] if "/" in file_relative_path else file_relative_path
+        file_name = decoded_path.split("/")[-1]
 
         children_url = f"https://graph.microsoft.com/v1.0/drives/{qlibrary_drive_id}/items/{temp_folder_id}/children"
         children_res = requests.get(children_url, headers=headers)
