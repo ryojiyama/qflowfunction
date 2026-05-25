@@ -4,11 +4,13 @@ import segno
 import io
 import base64
 from font_assets import FONT_NORMAL_B64, FONT_BOLD_B64
+from logo_assets import LOGO_PNG_B64
 import json
 import os
 import logging
 import msal
 import requests
+import urllib.parse
 from datetime import datetime, timezone
 
 app = func.FunctionApp()
@@ -25,19 +27,58 @@ def get_access_token():
         return result["access_token"]
     raise Exception(f"トークン取得失敗: {result.get('error_description')}")
 
-# --- SharePointの絶対URLをGraph API用にエンコードする関数 ---
-def encode_sharing_url(url: str) -> str:
-    """SharePointの絶対URLをGraph APIの /shares/ エンドポイントで使える形式に変換する"""
-    base64_value = base64.b64encode(url.encode('utf-8')).decode('utf-8')
-    encoded_url = "u!" + base64_value.rstrip('=').replace('/', '_').replace('+', '-')
-    return encoded_url
+def get_first_string(val) -> str:
+    if not val:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, list):
+        for item in val:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+            elif isinstance(item, dict):
+                label = item.get('Label') or item.get('Value') or str(item)
+                if label and label.strip(): return label.strip()
+    if isinstance(val, dict):
+        label = val.get('Label') or val.get('Value') or str(val)
+        return label.strip() if label else ""
+    return str(val).strip()
 
-# --- 既存のPDFスタンプ＆暗号化ロジック ---
-def process_pdf_stamping(pdf_bytes: bytes, meta: dict) -> bytes:
+def get_string_array(val) -> list:
+    if not val:
+        return []
+    if isinstance(val, str):
+        return [val.strip()] if val.strip() else []
+    if isinstance(val, list):
+        extracted = []
+        for item in val:
+            if isinstance(item, str) and item.strip():
+                extracted.append(item.strip())
+            elif isinstance(item, dict):
+                label = item.get('Label') or item.get('Value') or str(item)
+                if label and label.strip(): extracted.append(label.strip())
+        return extracted
+    if isinstance(val, dict):
+        label = val.get('Label') or val.get('Value') or str(val)
+        return [label.strip()] if label and label.strip() else []
+    return [str(val).strip()] if str(val).strip() else []
+
+# =====================================================================
+#  【デザイン拡張版：PDFスタンプ＆暗号化ロジック（確定レイアウト維持）】
+# =====================================================================
+def process_pdf_stamping(pdf_bytes: bytes, meta: dict, original_filename: str) -> bytes:
     font_data_normal = base64.b64decode(FONT_NORMAL_B64)
     font_data_bold   = base64.b64decode(FONT_BOLD_B64)
 
+    logo_bytes = b""
+    if LOGO_PNG_B64 and "YOUR_BASE64" not in LOGO_PNG_B64:
+        try:
+            logo_bytes = base64.b64decode("".join(LOGO_PNG_B64.split()))
+        except Exception as e:
+            logging.error(f"ロゴデコード失敗: {e}")
+
     doc = fitz.open("pdf", io.BytesIO(pdf_bytes))
+
     qr_url = meta.get('qr_url', 'https://tshldgs.sharepoint.com/sites/QualityAssurance')
     qr_buf = io.BytesIO()
     segno.make_qr(qr_url).save(qr_buf, kind='png', scale=4)
@@ -48,20 +89,54 @@ def process_pdf_stamping(pdf_bytes: bytes, meta: dict) -> bytes:
         if rotation != 0: page.set_rotation(0)
 
         rect = page.rect
-        y_top_footer = rect.y1 - 45.36
+        footer_height = 45.0
+        y_top_footer = rect.y1 - footer_height
 
         page.insert_font(fontname="jp-normal", fontbuffer=font_data_normal)
         page.insert_font(fontname="jp-bold",   fontbuffer=font_data_bold)
 
-        page.draw_rect(fitz.Rect(rect.x0, y_top_footer, rect.x1, rect.y1), color=(1, 1, 1), fill=(1, 1, 1), fill_opacity=0.9)
-        page.insert_image(fitz.Rect(rect.x0 + 15, y_top_footer + 5, rect.x0 + 50, y_top_footer + 40), stream=qr_bytes)
+        page.draw_rect(fitz.Rect(rect.x0, y_top_footer, rect.x1, rect.y1), color=(1, 1, 1), fill=(1, 1, 1), fill_opacity=0.95)
 
-        id_text = meta.get('integrated_id') or f"{meta.get('dept', '')}-{meta.get('product', '')}-{meta.get('category', '')}-{meta.get('seq', '')}"
-        page.insert_text((rect.x0 + 65, rect.y1 - 28), id_text, fontsize=8, fontname="jp-bold", color=(0, 0, 0))
+        if logo_bytes:
+            logo_rect = fitz.Rect(rect.x0 + 15, y_top_footer + 11.5, rect.x0 + 71, rect.y1 - 11.5)
+            page.insert_image(logo_rect, stream=logo_bytes)
 
-        attr_text = f"改正日: {meta.get('rev_date', '')} │ 機密レベル: {meta.get('confidential_level', 'Internal')}"
-        page.insert_text((rect.x0 + 65, rect.y1 - 15), attr_text, fontsize=7, fontname="jp-normal", color=(0, 0, 0))
-        page.insert_text((rect.x1 - 70, rect.y1 - 20), f"Page {page.number + 1} / {doc.page_count}", fontsize=8, fontname="jp-normal", color=(0, 0, 0))
+        divider_x = rect.x0 + 79
+        page.draw_line(fitz.Point(divider_x, y_top_footer + 5), fitz.Point(divider_x, rect.y1 - 5), color=(0.7, 0.7, 0.7), width=0.8)
+
+        y_center = rect.y1 / 2.0
+        qr_rect_side = fitz.Rect(rect.x0 + 10, y_center - 17.5, rect.x0 + 45, y_center + 17.5)
+        page.insert_image(qr_rect_side, stream=qr_bytes)
+
+        caption_text = "追跡用QR"
+        page.insert_text((rect.x0 + 12, y_center + 24), caption_text, fontsize=5.0, fontname="jp-normal", color=(0.5, 0.5, 0.5))
+
+        line1_list = []
+        line1_list.append(original_filename)
+        dept = get_first_string(meta.get('QS_Department', ''))
+        if dept: line1_list.append(dept)
+        pg = get_first_string(meta.get('QS_ProductGroup', ''))
+        if pg and pg not in ['その他', 'その他 ', '空', '']: line1_list.append(pg)
+        line1_text = "  ·  ".join(line1_list)
+
+        control_num = get_first_string(meta.get('QS_ControlNumber', '—'))
+        rev_date = meta.get('determined_revision_date', '')
+        conf_level = get_first_string(meta.get('QS_ConfLevel', 'Internal'))
+
+        line2_text = f"文書番号: {control_num}  ·  発行日: {rev_date}  ·  開示範囲: {conf_level}  ·  © TOYO SAFETY CO., LTD."
+        page_num_text = f"Page {page.number + 1} / {doc.page_count}"
+
+        metadata_start_x = divider_x + 8
+        y_line1 = rect.y1 - 26.0
+        y_line2 = rect.y1 - 14.0
+
+        page.insert_text((metadata_start_x, y_line1), line1_text, fontsize=7.5, fontname="jp-normal", color=(0, 0, 0))
+        page.insert_text((metadata_start_x, y_line2), line2_text, fontsize=6.5, fontname="jp-normal", color=(0.4, 0.4, 0.4))
+
+        page_num_x = rect.x1 - 60
+        page.insert_text((page_num_x, y_line2), page_num_text, fontsize=6.5, fontname="jp-normal", color=(0.4, 0.4, 0.4))
+
+        page.draw_line(fitz.Point(rect.x0, y_top_footer), fitz.Point(rect.x1, y_top_footer), color=(0.8, 0.8, 0.8), width=0.5)
 
         if rotation != 0: page.set_rotation(rotation)
 
@@ -80,13 +155,12 @@ def process_pdf_stamping(pdf_bytes: bytes, meta: dict) -> bytes:
     return output_buffer.getvalue()
 
 # =====================================================================
-#  【Azure Functions HTTP Trigger (SOW v4仕様)】
+#  【Azure Functions HTTP Trigger】
 # =====================================================================
 @app.route(route="StampPDF", auth_level=func.AuthLevel.FUNCTION)
 def StampPDF(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("SOW v4: StampPDF 非同期処理を開始します。")
+    logging.info("SOW v8.4: StampPDF 文書分類追加・メタデータ完全移植版を開始します。")
     try:
-        # 1. パラメーター取得
         body = req.get_json()
         distribution_id = body.get("distribution_id")
         temp_file_url = body.get("temp_file_url")
@@ -94,66 +168,114 @@ def StampPDF(req: func.HttpRequest) -> func.HttpResponse:
         if not distribution_id or not temp_file_url:
             return func.HttpResponse(json.dumps({"status": "error", "error": "distribution_id or temp_file_url is missing"}), status_code=400)
 
-        # 2. 認証
         token = get_access_token()
         headers = {"Authorization": f"Bearer {token}"}
+
         site_id = os.environ.get("SHAREPOINT_SITE_ID")
+        qlibrary_drive_id = os.environ.get("QLIBRARY_DRIVE_ID")
+        qpublished_drive_id = os.environ.get("QPUBLISHED_DRIVE_ID")
+        temp_folder_id = os.environ.get("TEMP_FOLDER_ID")
         list_id = os.environ.get("DISTRIBUTION_LOG_LIST_ID")
 
-        # 3. URLからSharePointのサイトIDおよびアイテムIDを分解解決（Graph APIのsharesエンドポイント使用）
-        encoded_url = encode_sharing_url(temp_file_url)
-        share_res = requests.get(f"https://graph.microsoft.com/v1.0/shares/{encoded_url}/driveItem", headers=headers)
-        if share_res.status_code != 200:
-            raise Exception(f"ファイルが見つかりません。URLを確認してください: {share_res.text}")
+        if not site_id or not qlibrary_drive_id or not qpublished_drive_id or not temp_folder_id:
+            raise Exception("環境変数未設定エラー")
 
-        drive_item = share_res.json()
-        drive_id = drive_item['parentReference']['driveId']
-        item_id = drive_item['id']
-        file_name = drive_item['name'] # 例: 123_input.xlsx
+        parsed_url = urllib.parse.urlparse(temp_file_url)
+        decoded_path = urllib.parse.unquote(parsed_url.path)
+        file_relative_path = decoded_path.split("Shared Documents/")[1]
+        file_name = file_relative_path.rsplit("/", 1)[1] if "/" in file_relative_path else file_relative_path
 
-        # 4. Word/Excelから直接PDFストリームとしてPull（サイズ制約回避）
-        logging.info("Graph APIを利用してWord/ExcelをPDFとしてオンデマンド変換中...")
-        convert_res = requests.get(f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content?format=pdf", headers=headers, stream=True)
-        if convert_res.status_code != 200:
-            raise Exception("graph_conversion_failed")
+        children_url = f"https://graph.microsoft.com/v1.0/drives/{qlibrary_drive_id}/items/{temp_folder_id}/children"
+        children_res = requests.get(children_url, headers=headers)
+        items = children_res.json().get('value', [])
+        item_id = next((i.get('id') for i in items if i.get('name') == file_name), None)
+        if not item_id: raise Exception(f"'{file_name}' が見つかりませんでした。")
+
+        convert_url = f"https://graph.microsoft.com/v1.0/drives/{qlibrary_drive_id}/items/{item_id}/content?format=pdf"
+        convert_res = requests.get(convert_url, headers=headers, stream=True)
         pdf_bytes = convert_res.content
 
-        # 5. メタデータをDistributionLogから取得 (ローカル検証時はダミー値を使用可能)
-        # ※リストが未整備の場合でもテストが通るように、辞書の get() メソッドで安全に取得します。
-        metadata = {}
-        log_res = requests.get(f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{distribution_id}?expand=fields", headers=headers)
-        if log_res.status_code == 200:
-            metadata = log_res.json().get('fields', {})
-            logging.info("DistributionLogからメタデータの取得に成功しました。")
-        else:
-            logging.warning(f"リストからのメタデータ取得に失敗（テスト用のダミー値を使用）: {log_res.text}")
-            metadata = {"dept": "QA", "product": "Test", "seq": distribution_id}
+        meta_url = f"https://graph.microsoft.com/v1.0/drives/{qlibrary_drive_id}/items/{item_id}/listitem?expand=fields"
+        meta_res = requests.get(meta_url, headers=headers)
+        metadata = meta_res.json().get('fields', {}) if meta_res.status_code == 200 else {}
 
-        # 6. スタンプ付与 & 7. AES-256暗号化
-        logging.info("PDFのスタンプ加工および暗号化を実行中...")
-        secured_pdf_bytes = process_pdf_stamping(pdf_bytes, metadata)
+        determined_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if distribution_id and list_id and site_id:
+            log_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{distribution_id}?expand=fields"
+            log_res = requests.get(log_url, headers=headers)
+            if log_res.status_code == 200:
+                issue_date = log_res.json().get('fields', {}).get('QS_IssueDate')
+                if issue_date: determined_date = issue_date.split("T")[0] if "T" in issue_date else issue_date
 
-        # 8. 出力先ライブラリ（Issuedフォルダ）へアップロード
-        # 保存ファイル名: "元のファイル名_stamped.pdf" または "{配布ID}_stamped.pdf"
-        output_filename = f"{distribution_id}_stamped.pdf"
-        upload_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/Issued/{output_filename}:/content"
+        metadata['determined_revision_date'] = determined_date
+        base_name, _ = os.path.splitext(file_name)
+        output_filename = f"{base_name}.pdf"
 
-        logging.info(f"Issuedフォルダへアップロード中: {output_filename}")
+        secured_pdf_bytes = process_pdf_stamping(pdf_bytes, metadata, base_name)
+
+        encoded_output_filename = urllib.parse.quote(output_filename)
+        upload_url = f"https://graph.microsoft.com/v1.0/drives/{qpublished_drive_id}/root:/{encoded_output_filename}:/content"
         upload_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/pdf"}
         upload_res = requests.put(upload_url, headers=upload_headers, data=secured_pdf_bytes)
 
-        if upload_res.status_code not in [200, 201]:
-            raise Exception("upload_failed")
+        upload_json = upload_res.json()
+        output_file_url = upload_json.get('webUrl')
+        published_item_id = upload_json.get('id')
 
-        output_file_url = upload_res.json().get('webUrl')
+        # 💡 APIのデータ型に合わせて安全な自動移植用ペイロードを構築
+        if published_item_id and metadata:
+            fields_payload = {}
 
-        # 9. 【安全設計】用済みの _temp 内のコピーファイル（Word/Excel）を物理削除
-        logging.info(f"一時ファイル（_temp）のクリーンアップを実行中... ItemID: {item_id}")
-        del_res = requests.delete(f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}", headers=headers)
-        if del_res.status_code != 204:
-            logging.warning(f"一時ファイルの削除に失敗しました（処理は継続します）: {del_res.text}")
+            # 1. 所管部門 (選択肢)
+            dept_val = get_first_string(metadata.get("QS_Department"))
+            if dept_val: fields_payload["QS_Department"] = dept_val
 
-        # 10. 完了レスポンス（Flow Bがこれを受け取って台帳を更新する）
+            # 2. 商品グループ (複数選択肢) ※型宣言タグをセット
+            pg_val = get_string_array(metadata.get("QS_ProductGroup"))
+            if pg_val:
+                fields_payload["QS_ProductGroup@odata.type"] = "Collection(Edm.String)"
+                fields_payload["QS_ProductGroup"] = pg_val
+
+            # 3. 管理番号 (1行テキスト)
+            ctrl_val = get_first_string(metadata.get("QS_ControlNumber"))
+            if ctrl_val: fields_payload["QS_ControlNumber"] = ctrl_val
+
+            # 4. 機密レベル (選択肢)
+            conf_val = get_first_string(metadata.get("QS_ConfLevel"))
+            if conf_val: fields_payload["QS_ConfLevel"] = conf_val
+
+            # 5. 改正日 (日付時刻 -> ISO 8601フォーマット)
+            rev_date = metadata.get('determined_revision_date')
+            if rev_date:
+                fields_payload["QS_RevisionDate"] = f"{rev_date}T00:00:00Z" if "T" not in rev_date else rev_date
+
+            # 6. アクセス権限 (選択肢)
+            access_val = get_first_string(metadata.get("QS_AccessRights"))
+            if access_val: fields_payload["QS_AccessRights"] = access_val
+
+            # 7. QMS要求事項 (選択肢)
+            qms_val = get_first_string(metadata.get("QS_QMSRequireNum"))
+            if qms_val: fields_payload["QS_QMSRequireNum"] = qms_val
+
+            # 8. 💡【新規追加】文書分類 (選択肢)
+            cat_val = get_first_string(metadata.get("QS_DocCategory"))
+            if cat_val: fields_payload["QS_DocCategory"] = cat_val
+
+            if fields_payload:
+                patch_metadata_url = f"https://graph.microsoft.com/v1.0/drives/{qpublished_drive_id}/items/{published_item_id}/listitem/fields"
+                patch_res = requests.patch(patch_metadata_url, headers=headers, json=fields_payload)
+
+                # エラーガード：拒否された場合はログに詳細を出して500エラー停止
+                if patch_res.status_code not in [200, 201]:
+                    error_msg = f"サイト列の更新に失敗（Graph API拒否）: {patch_res.text}"
+                    logging.error(error_msg)
+                    raise Exception(error_msg)
+                else:
+                    logging.info("Q-Publishedへのサイト列メタデータの移植（完全版）が正常に完了しました。")
+
+        delete_url = f"https://graph.microsoft.com/v1.0/drives/{qlibrary_drive_id}/items/{item_id}"
+        requests.delete(delete_url, headers=headers)
+
         result = {
             "status": "success",
             "output_file_url": output_file_url,
@@ -162,6 +284,4 @@ def StampPDF(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(json.dumps(result), mimetype="application/json", status_code=200)
 
     except Exception as e:
-        error_msg = str(e)
-        logging.error(f"エラー発生: {error_msg}")
-        return func.HttpResponse(json.dumps({"status": "error", "error": error_msg}), status_code=500, mimetype="application/json")
+        return func.HttpResponse(json.dumps({"status": "error", "error": str(e)}), status_code=500, mimetype="application/json")
