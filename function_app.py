@@ -120,10 +120,11 @@ def process_pdf_stamping(pdf_bytes: bytes, meta: dict, original_filename: str) -
         line1_text = "  ·  ".join(line1_list)
 
         control_num = get_first_string(meta.get('QS_ControlNumber', '—'))
+        version_str = get_first_string(meta.get('_UIVersionString', '—'))
         rev_date = meta.get('determined_revision_date', '')
         conf_level = get_first_string(meta.get('QS_ConfLevel', 'Internal'))
 
-        line2_text = f"文書番号: {control_num}  ·  発行日: {rev_date}  ·  開示範囲: {conf_level}  ·  © TOYO SAFETY CO., LTD."
+        line2_text = f"文書番号: {control_num}  ·  バージョン: {version_str}  ·  発行日: {rev_date}  ·  開示範囲: {conf_level}  ·  © TOYO SAFETY CO., LTD."
         page_num_text = f"Page {page.number + 1} / {doc.page_count}"
 
         metadata_start_x = divider_x + 8
